@@ -135,7 +135,7 @@ async def fetch_stream(prompt: str, system_instructions: Optional[str]):
 async def root():
     return RootResponse(
         success=True,
-        message="Use GET or POST /chat to interact with OverChat AI.",
+        message="Use GET or POST /chat to interact with Claude haiku 4.6 AI.",
     )
 
 
