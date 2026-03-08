@@ -1,0 +1,179 @@
+import uuid
+from typing import Optional
+
+import httpx
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
+
+app = FastAPI(
+    title="OverChat AI API",
+    version="1.0.0",
+    description="OverChat AI wrapper service.",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+OVERCHAT_URL = "https://api.overchat.ai/v1/chat/completions"
+
+OVERCHAT_HEADERS = {
+    "Content-Type": "application/json",
+    "Accept": "*/*",
+    "X-Device-Platform": "web",
+    "X-Device-Language": "id-ID",
+    "X-Device-Uuid": "0084ff72-2faf-4338-ac78-f0e59fad3108",
+    "X-Device-Version": "1.0.44",
+    "Origin": "https://overchat.ai",
+}
+
+
+class ChatRequest(BaseModel):
+    prompt: str = Field(..., description="User prompt")
+    systemInstructions: Optional[str] = Field(None, description="System instructions")
+    stream: bool = Field(False, description="Stream response")
+
+
+class ChatResponse(BaseModel):
+    success: bool
+    response: str
+
+
+class RootResponse(BaseModel):
+    success: bool
+    message: str
+
+
+def build_payload(prompt: str, system_instructions: Optional[str], stream: bool) -> dict:
+    return {
+        "chatId": str(uuid.uuid4()),
+        "model": "claude-haiku-4-5-20251001",
+        "messages": [
+            {
+                "id": str(uuid.uuid4()),
+                "role": "user",
+                "content": prompt,
+            },
+            {
+                "id": str(uuid.uuid4()),
+                "role": "system",
+                "content": system_instructions or "",
+            },
+        ],
+        "personaId": "claude-haiku-4-5-landing",
+        "frequency_penalty": 0,
+        "max_tokens": 4000,
+        "presence_penalty": 0,
+        "stream": True,
+        "temperature": 0.5,
+        "top_p": 0.95,
+    }
+
+
+def parse_sse_line(line: str) -> str:
+    if not line.startswith("data: "):
+        return ""
+    data_str = line[6:].strip()
+    if data_str == "[DONE]":
+        return ""
+    try:
+        import json
+        data = json.loads(data_str)
+        choices = data.get("choices")
+        if choices and len(choices) > 0:
+            delta = choices[0].get("delta")
+            if delta:
+                content = delta.get("content")
+                if content:
+                    return content
+    except (json.JSONDecodeError, KeyError, TypeError, IndexError):
+        pass
+    return ""
+
+
+async def fetch_full(prompt: str, system_instructions: Optional[str]) -> str:
+    payload = build_payload(prompt, system_instructions, False)
+    async with httpx.AsyncClient(timeout=httpx.Timeout(120.0)) as client:
+        resp = await client.post(OVERCHAT_URL, json=payload, headers=OVERCHAT_HEADERS)
+        if resp.status_code != 200:
+            raise HTTPException(status_code=resp.status_code, detail=resp.text)
+        result = ""
+        for line in resp.text.split("\n"):
+            line = line.strip()
+            if line:
+                result += parse_sse_line(line)
+        return result
+
+
+async def fetch_stream(prompt: str, system_instructions: Optional[str]):
+    payload = build_payload(prompt, system_instructions, True)
+    async with httpx.AsyncClient(timeout=httpx.Timeout(120.0)) as client:
+        async with client.stream(
+            "POST", OVERCHAT_URL, json=payload, headers=OVERCHAT_HEADERS
+        ) as resp:
+            if resp.status_code != 200:
+                raise HTTPException(status_code=resp.status_code, detail="Upstream error")
+            buffer = ""
+            async for chunk in resp.aiter_text():
+                buffer += chunk
+                while "\n" in buffer:
+                    line, buffer = buffer.split("\n", 1)
+                    line = line.strip()
+                    if line:
+                        content = parse_sse_line(line)
+                        if content:
+                            yield content
+
+
+@app.get("/", response_model=RootResponse)
+async def root():
+    return RootResponse(
+        success=True,
+        message="Use GET or POST /chat to interact with OverChat AI.",
+    )
+
+
+@app.get("/chat")
+async def chat_get(
+    prompt: str = Query(..., description="User prompt"),
+    systemInstructions: Optional[str] = Query(None, description="System instructions"),
+    stream: bool = Query(False, description="Stream response"),
+):
+    if not prompt.strip():
+        raise HTTPException(status_code=400, detail="Prompt cannot be empty.")
+    if stream:
+        return StreamingResponse(
+            fetch_stream(prompt.strip(), systemInstructions),
+            media_type="text/plain; charset=utf-8",
+        )
+    try:
+        result = await fetch_full(prompt.strip(), systemInstructions)
+        return ChatResponse(success=True, response=result)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/chat")
+async def chat_post(request: ChatRequest):
+    if not request.prompt.strip():
+        raise HTTPException(status_code=400, detail="Prompt cannot be empty.")
+    if request.stream:
+        return StreamingResponse(
+            fetch_stream(request.prompt.strip(), request.systemInstructions),
+            media_type="text/plain; charset=utf-8",
+        )
+    try:
+        result = await fetch_full(request.prompt.strip(), request.systemInstructions)
+        return ChatResponse(success=True, response=result)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
