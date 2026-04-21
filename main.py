@@ -78,6 +78,7 @@ def build_payload(prompt: str, system_instructions: Optional[str], stream: bool,
 
 
 def parse_sse_line(line: str) -> str:
+    # Handle both direct SSE lines and escaped JSON strings
     if not line.startswith("data: "):
         return ""
     data_str = line[6:].strip()
@@ -98,6 +99,38 @@ def parse_sse_line(line: str) -> str:
     return ""
 
 
+def parse_detail_content(detail_str: str) -> str:
+    """Parse SSE content from a detail string that may contain escaped newlines."""
+    import json
+    
+    result = ""
+    # Split by double newlines to get individual data blocks
+    blocks = detail_str.split("\n\n")
+    
+    for block in blocks:
+        block = block.strip()
+        if not block:
+            continue
+        # Remove 'data: ' prefix if present
+        if block.startswith("data: "):
+            block = block[6:].strip()
+        if block == "[DONE]":
+            continue
+        try:
+            data = json.loads(block)
+            choices = data.get("choices")
+            if choices and len(choices) > 0:
+                delta = choices[0].get("delta")
+                if delta:
+                    content = delta.get("content")
+                    if content:
+                        result += content
+        except (json.JSONDecodeError, KeyError, TypeError, IndexError):
+            pass
+    
+    return result
+
+
 async def fetch_full(prompt: str, system_instructions: Optional[str], model: Optional[str] = None) -> str:
     payload = build_payload(prompt, system_instructions, False, model)
     async with httpx.AsyncClient(timeout=httpx.Timeout(120.0)) as client:
@@ -107,19 +140,32 @@ async def fetch_full(prompt: str, system_instructions: Optional[str], model: Opt
         
         content = resp.text
         
-        # Check if response is already clean JSON (non-streaming mode)
+        # Try to parse the response - it might be wrapped in {"detail": "..."} or direct JSON/SSE
         try:
             import json
             data = json.loads(content)
-            choices = data.get("choices", [])
-            if choices and len(choices) > 0:
-                message = choices[0].get("message", {})
-                if message:
-                    return message.get("content", "")
+            
+            # Check if response has a "detail" field containing the actual SSE data
+            if "detail" in data:
+                detail_str = data["detail"]
+                # Parse the detail string which contains escaped newlines
+                result = parse_detail_content(detail_str)
+                if result:
+                    return result
+            
+            # Try parsing as direct non-streaming response (with choices[].message)
+            if isinstance(data, dict) and "choices" in data:
+                choices = data.get("choices", [])
+                if choices and len(choices) > 0:
+                    message = choices[0].get("message", {})
+                    if message:
+                        result = message.get("content", "")
+                        if result:
+                            return result
         except (json.JSONDecodeError, KeyError, TypeError):
             pass
         
-        # Parse SSE format (streaming mode response)
+        # Fallback: Parse SSE format directly from content
         result = ""
         for line in content.split("\n"):
             line = line.strip()
