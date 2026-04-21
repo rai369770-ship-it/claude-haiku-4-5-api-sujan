@@ -38,6 +38,7 @@ class ChatRequest(BaseModel):
     prompt: str = Field(..., description="User prompt")
     systemInstructions: Optional[str] = Field(None, description="System instructions")
     stream: bool = Field(False, description="Stream response")
+    model: Optional[str] = Field(None, description="Model name to use")
 
 
 class ChatResponse(BaseModel):
@@ -50,10 +51,10 @@ class RootResponse(BaseModel):
     message: str
 
 
-def build_payload(prompt: str, system_instructions: Optional[str], stream: bool) -> dict:
+def build_payload(prompt: str, system_instructions: Optional[str], stream: bool, model: Optional[str] = None) -> dict:
     return {
         "chatId": str(uuid.uuid4()),
-        "model": "claude-haiku-4-5-20251001",
+        "model": model or "claude-haiku-4-5-20251001",
         "messages": [
             {
                 "id": str(uuid.uuid4()),
@@ -66,7 +67,7 @@ def build_payload(prompt: str, system_instructions: Optional[str], stream: bool)
                 "content": system_instructions or "",
             },
         ],
-        "personaId": "claude-haiku-4-5-landing",
+        "personaId": model or "claude-haiku-4-5-landing",
         "frequency_penalty": 0,
         "max_tokens": 4000,
         "presence_penalty": 0,
@@ -97,8 +98,8 @@ def parse_sse_line(line: str) -> str:
     return ""
 
 
-async def fetch_full(prompt: str, system_instructions: Optional[str]) -> str:
-    payload = build_payload(prompt, system_instructions, False)
+async def fetch_full(prompt: str, system_instructions: Optional[str], model: Optional[str] = None) -> str:
+    payload = build_payload(prompt, system_instructions, False, model)
     async with httpx.AsyncClient(timeout=httpx.Timeout(120.0)) as client:
         resp = await client.post(OVERCHAT_URL, json=payload, headers=OVERCHAT_HEADERS)
         if resp.status_code != 200:
@@ -111,8 +112,8 @@ async def fetch_full(prompt: str, system_instructions: Optional[str]) -> str:
         return result
 
 
-async def fetch_stream(prompt: str, system_instructions: Optional[str]):
-    payload = build_payload(prompt, system_instructions, True)
+async def fetch_stream(prompt: str, system_instructions: Optional[str], model: Optional[str] = None):
+    payload = build_payload(prompt, system_instructions, True, model)
     async with httpx.AsyncClient(timeout=httpx.Timeout(120.0)) as client:
         async with client.stream(
             "POST", OVERCHAT_URL, json=payload, headers=OVERCHAT_HEADERS
@@ -144,16 +145,17 @@ async def chat_get(
     prompt: str = Query(..., description="User prompt"),
     systemInstructions: Optional[str] = Query(None, description="System instructions"),
     stream: bool = Query(False, description="Stream response"),
+    model: Optional[str] = Query(None, description="Model name to use"),
 ):
     if not prompt.strip():
         raise HTTPException(status_code=400, detail="Prompt cannot be empty.")
     if stream:
         return StreamingResponse(
-            fetch_stream(prompt.strip(), systemInstructions),
+            fetch_stream(prompt.strip(), systemInstructions, model),
             media_type="text/plain; charset=utf-8",
         )
     try:
-        result = await fetch_full(prompt.strip(), systemInstructions)
+        result = await fetch_full(prompt.strip(), systemInstructions, model)
         return ChatResponse(success=True, response=result)
     except HTTPException:
         raise
@@ -167,11 +169,11 @@ async def chat_post(request: ChatRequest):
         raise HTTPException(status_code=400, detail="Prompt cannot be empty.")
     if request.stream:
         return StreamingResponse(
-            fetch_stream(request.prompt.strip(), request.systemInstructions),
+            fetch_stream(request.prompt.strip(), request.systemInstructions, request.model),
             media_type="text/plain; charset=utf-8",
         )
     try:
-        result = await fetch_full(request.prompt.strip(), request.systemInstructions)
+        result = await fetch_full(request.prompt.strip(), request.systemInstructions, request.model)
         return ChatResponse(success=True, response=result)
     except HTTPException:
         raise
