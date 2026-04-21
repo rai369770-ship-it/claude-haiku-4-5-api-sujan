@@ -71,7 +71,7 @@ def build_payload(prompt: str, system_instructions: Optional[str], stream: bool,
         "frequency_penalty": 0,
         "max_tokens": 4000,
         "presence_penalty": 0,
-        "stream": True,
+        "stream": stream,
         "temperature": 0.5,
         "top_p": 0.95,
     }
@@ -104,8 +104,24 @@ async def fetch_full(prompt: str, system_instructions: Optional[str], model: Opt
         resp = await client.post(OVERCHAT_URL, json=payload, headers=OVERCHAT_HEADERS)
         if resp.status_code != 200:
             raise HTTPException(status_code=resp.status_code, detail=resp.text)
+        
+        content = resp.text
+        
+        # Check if response is already clean JSON (non-streaming mode)
+        try:
+            import json
+            data = json.loads(content)
+            choices = data.get("choices", [])
+            if choices and len(choices) > 0:
+                message = choices[0].get("message", {})
+                if message:
+                    return message.get("content", "")
+        except (json.JSONDecodeError, KeyError, TypeError):
+            pass
+        
+        # Parse SSE format (streaming mode response)
         result = ""
-        for line in resp.text.split("\n"):
+        for line in content.split("\n"):
             line = line.strip()
             if line:
                 result += parse_sse_line(line)
