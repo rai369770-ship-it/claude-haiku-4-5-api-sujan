@@ -1,3 +1,5 @@
+import json
+import os
 import uuid
 from typing import Optional
 
@@ -21,7 +23,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-OVERCHAT_URL = "https://api.overchat.ai/v1/chat/completions"
+BASE_URL = os.environ.get("base_url", "https://api.overchat.ai")
+OVERCHAT_URL = f"{BASE_URL}/v1/chat/completions"
 
 OVERCHAT_HEADERS = {
     "Content-Type": "application/json",
@@ -34,10 +37,13 @@ OVERCHAT_HEADERS = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Pydantic models
+# ---------------------------------------------------------------------------
+
 class ChatRequest(BaseModel):
     prompt: str = Field(..., description="User prompt")
     systemInstructions: Optional[str] = Field(None, description="System instructions")
-    stream: bool = Field(False, description="Stream response")
     model: Optional[str] = Field(None, description="Model name to use")
 
 
@@ -51,7 +57,16 @@ class RootResponse(BaseModel):
     message: str
 
 
-def build_payload(prompt: str, system_instructions: Optional[str], stream: bool, model: Optional[str] = None) -> dict:
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def build_payload(
+    prompt: str,
+    system_instructions: Optional[str],
+    stream: bool,
+    model: Optional[str] = None,
+) -> dict:
     return {
         "chatId": str(uuid.uuid4()),
         "model": model or "claude-haiku-4-5-20251001",
@@ -77,135 +92,142 @@ def build_payload(prompt: str, system_instructions: Optional[str], stream: bool,
     }
 
 
+def extract_ai_text(raw_text: str) -> str:
+    """
+    Parse a raw SSE response string and return the concatenated AI content.
+    Handles both literal newlines and escaped '\\n' sequences.
+    """
+    # Normalise escaped newlines that some proxies introduce
+    raw_text = raw_text.replace("\\\\n", "\n").replace("\\n", "\n")
+
+    full_text = ""
+
+    for line in raw_text.splitlines():
+        line = line.strip()
+
+        if not line.startswith("data: "):
+            continue
+
+        data = line[6:].strip()
+
+        if data == "[DONE]":
+            break
+
+        try:
+            payload = json.loads(data)
+        except json.JSONDecodeError:
+            continue
+
+        delta = payload.get("choices", [{}])[0].get("delta", {})
+        content = delta.get("content")
+
+        if content:
+            full_text += content
+
+    return full_text
+
+
 def parse_sse_line(line: str) -> str:
-    # Handle both direct SSE lines and escaped JSON strings
+    """Return the delta content from a single SSE line, or '' if none."""
     if not line.startswith("data: "):
         return ""
     data_str = line[6:].strip()
     if data_str == "[DONE]":
         return ""
     try:
-        import json
         data = json.loads(data_str)
-        choices = data.get("choices")
-        if choices and len(choices) > 0:
-            delta = choices[0].get("delta")
-            if delta:
-                content = delta.get("content")
-                if content:
-                    return content
+        choices = data.get("choices") or []
+        if choices:
+            delta = choices[0].get("delta") or {}
+            return delta.get("content") or ""
     except (json.JSONDecodeError, KeyError, TypeError, IndexError):
         pass
     return ""
 
 
-def parse_detail_content(detail_str: str) -> str:
-    """Parse SSE content from a detail string that may contain escaped newlines."""
-    import json
-    
+# ---------------------------------------------------------------------------
+# Core fetch functions
+# ---------------------------------------------------------------------------
+
+async def fetch_full(
+    prompt: str,
+    system_instructions: Optional[str],
+    model: Optional[str] = None,
+) -> str:
+    """
+    Send a non-streaming request and return the fully assembled response text.
+    The upstream may still return SSE format even for non-streaming calls,
+    so we use extract_ai_text to handle both cases.
+    """
+    payload = build_payload(prompt, system_instructions, True, model)
+
+    async with httpx.AsyncClient(timeout=httpx.Timeout(120.0)) as client:
+        resp = await client.post(OVERCHAT_URL, json=payload, headers=OVERCHAT_HEADERS)
+
+        if resp.status_code != 200:
+            raise HTTPException(status_code=resp.status_code, detail=resp.text)
+
+        raw = resp.text
+
+    # ---- Try to unwrap {"detail": "<sse-blob>"} envelope first ----
+    try:
+        outer = json.loads(raw)
+
+        if isinstance(outer, dict) and "detail" in outer:
+            result = extract_ai_text(outer["detail"])
+            if result:
+                return result
+
+        # Direct non-streaming JSON with choices[].message.content
+        if isinstance(outer, dict) and "choices" in outer:
+            choices = outer.get("choices") or []
+            if choices:
+                # Non-streaming shape
+                message = choices[0].get("message") or {}
+                content = message.get("content")
+                if content:
+                    return content
+
+                # Single SSE chunk shape
+                delta = choices[0].get("delta") or {}
+                content = delta.get("content")
+                if content:
+                    return content
+
+    except (json.JSONDecodeError, KeyError, TypeError):
+        pass
+
+    # ---- Fallback: treat the whole body as SSE text ----
+    result = extract_ai_text(raw)
+    if result:
+        return result
+
+    # Last resort: line-by-line parse
     result = ""
-    
-    # Handle double-escaped newlines first (\\n -> \n)
-    if "\\\\n" in detail_str:
-        detail_str = detail_str.replace("\\\\n", "\n")
-    
-    # Then handle single-escaped newlines  
-    if "\\n" in detail_str:
-        detail_str = detail_str.replace("\\n", "\n")
-    
-    # Split by newlines to get individual data blocks
-    lines = detail_str.split("\n")
-    
-    for line in lines:
-        line = line.strip()
-        if not line:
-            continue
-        # Remove 'data: ' prefix if present
-        if line.startswith("data: "):
-            line = line[6:].strip()
-        if line == "[DONE]":
-            continue
-        try:
-            data = json.loads(line)
-            choices = data.get("choices")
-            if choices and len(choices) > 0:
-                delta = choices[0].get("delta")
-                if delta:
-                    content = delta.get("content")
-                    if content:
-                        result += content
-        except (json.JSONDecodeError, KeyError, TypeError, IndexError):
-            pass
-    
+    for line in raw.splitlines():
+        result += parse_sse_line(line.strip())
     return result
 
 
-async def fetch_full(prompt: str, system_instructions: Optional[str], model: Optional[str] = None) -> str:
-    payload = build_payload(prompt, system_instructions, False, model)
-    async with httpx.AsyncClient(timeout=httpx.Timeout(120.0)) as client:
-        resp = await client.post(OVERCHAT_URL, json=payload, headers=OVERCHAT_HEADERS)
-        if resp.status_code != 200:
-            raise HTTPException(status_code=resp.status_code, detail=resp.text)
-        
-        content = resp.text
-        
-        # Try to parse the response - it might be wrapped in {"detail": "..."} or direct JSON/SSE
-        try:
-            import json
-            data = json.loads(content)
-            
-            # Check if response has a "detail" field containing the actual SSE data
-            if "detail" in data:
-                detail_str = data["detail"]
-                # Parse the detail string which contains escaped newlines
-                result = parse_detail_content(detail_str)
-                if result:
-                    return result
-            
-            # Try parsing as direct non-streaming response (with choices[].message)
-            if isinstance(data, dict) and "choices" in data:
-                choices = data.get("choices", [])
-                if choices and len(choices) > 0:
-                    message = choices[0].get("message", {})
-                    if message:
-                        result = message.get("content", "")
-                        if result:
-                            return result
-                            
-            # If the response is already in SSE chunk format within the JSON, extract directly
-            # This handles cases where the API returns chunks inline with delta content
-            if isinstance(data, dict) and "choices" in data:
-                result = ""
-                choices = data.get("choices", [])
-                for choice in choices:
-                    delta = choice.get("delta", {})
-                    content_val = delta.get("content", "")
-                    if content_val:
-                        result += content_val
-                if result:
-                    return result
-        except (json.JSONDecodeError, KeyError, TypeError):
-            pass
-        
-        # Fallback: Parse SSE format directly from content
-        result = ""
-        for line in content.split("\n"):
-            line = line.strip()
-            if line:
-                parsed = parse_sse_line(line)
-                if parsed:
-                    result += parsed
-        return result
-
-
-async def fetch_stream(prompt: str, system_instructions: Optional[str], model: Optional[str] = None):
+async def fetch_stream(
+    prompt: str,
+    system_instructions: Optional[str],
+    model: Optional[str] = None,
+):
+    """
+    Async generator that yields text chunks from the upstream SSE stream.
+    """
     payload = build_payload(prompt, system_instructions, True, model)
+
     async with httpx.AsyncClient(timeout=httpx.Timeout(120.0)) as client:
         async with client.stream(
             "POST", OVERCHAT_URL, json=payload, headers=OVERCHAT_HEADERS
         ) as resp:
             if resp.status_code != 200:
-                raise HTTPException(status_code=resp.status_code, detail="Upstream error")
+                raise HTTPException(
+                    status_code=resp.status_code, detail="Upstream error"
+                )
+
             buffer = ""
             async for chunk in resp.aiter_text():
                 buffer += chunk
@@ -218,28 +240,31 @@ async def fetch_stream(prompt: str, system_instructions: Optional[str], model: O
                             yield content
 
 
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
+
 @app.get("/", response_model=RootResponse)
 async def root():
     return RootResponse(
         success=True,
-        message="Use GET or POST /chat to interact with Claude haiku 4.6 AI.",
+        message=(
+            "Use GET or POST /chat for a complete response, "
+            "or GET or POST /stream for a streaming response."
+        ),
     )
 
 
-@app.get("/chat")
+# ── /chat (no streaming) ────────────────────────────────────────────────────
+
+@app.get("/chat", response_model=ChatResponse)
 async def chat_get(
     prompt: str = Query(..., description="User prompt"),
     systemInstructions: Optional[str] = Query(None, description="System instructions"),
-    stream: bool = Query(False, description="Stream response"),
     model: Optional[str] = Query(None, description="Model name to use"),
 ):
     if not prompt.strip():
         raise HTTPException(status_code=400, detail="Prompt cannot be empty.")
-    if stream:
-        return StreamingResponse(
-            fetch_stream(prompt.strip(), systemInstructions, model),
-            media_type="text/plain; charset=utf-8",
-        )
     try:
         result = await fetch_full(prompt.strip(), systemInstructions, model)
         return ChatResponse(success=True, response=result)
@@ -249,19 +274,44 @@ async def chat_get(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/chat")
+@app.post("/chat", response_model=ChatResponse)
 async def chat_post(request: ChatRequest):
     if not request.prompt.strip():
         raise HTTPException(status_code=400, detail="Prompt cannot be empty.")
-    if request.stream:
-        return StreamingResponse(
-            fetch_stream(request.prompt.strip(), request.systemInstructions, request.model),
-            media_type="text/plain; charset=utf-8",
-        )
     try:
-        result = await fetch_full(request.prompt.strip(), request.systemInstructions, request.model)
+        result = await fetch_full(
+            request.prompt.strip(), request.systemInstructions, request.model
+        )
         return ChatResponse(success=True, response=result)
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── /stream (always streams) ────────────────────────────────────────────────
+
+@app.get("/stream")
+async def stream_get(
+    prompt: str = Query(..., description="User prompt"),
+    systemInstructions: Optional[str] = Query(None, description="System instructions"),
+    model: Optional[str] = Query(None, description="Model name to use"),
+):
+    if not prompt.strip():
+        raise HTTPException(status_code=400, detail="Prompt cannot be empty.")
+    return StreamingResponse(
+        fetch_stream(prompt.strip(), systemInstructions, model),
+        media_type="text/plain; charset=utf-8",
+    )
+
+
+@app.post("/stream")
+async def stream_post(request: ChatRequest):
+    if not request.prompt.strip():
+        raise HTTPException(status_code=400, detail="Prompt cannot be empty.")
+    return StreamingResponse(
+        fetch_stream(
+            request.prompt.strip(), request.systemInstructions, request.model
+        ),
+        media_type="text/plain; charset=utf-8",
+    )
