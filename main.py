@@ -104,20 +104,29 @@ def parse_detail_content(detail_str: str) -> str:
     import json
     
     result = ""
-    # Split by double newlines to get individual data blocks
-    blocks = detail_str.split("\n\n")
     
-    for block in blocks:
-        block = block.strip()
-        if not block:
+    # Handle double-escaped newlines first (\\n -> \n)
+    if "\\\\n" in detail_str:
+        detail_str = detail_str.replace("\\\\n", "\n")
+    
+    # Then handle single-escaped newlines  
+    if "\\n" in detail_str:
+        detail_str = detail_str.replace("\\n", "\n")
+    
+    # Split by newlines to get individual data blocks
+    lines = detail_str.split("\n")
+    
+    for line in lines:
+        line = line.strip()
+        if not line:
             continue
         # Remove 'data: ' prefix if present
-        if block.startswith("data: "):
-            block = block[6:].strip()
-        if block == "[DONE]":
+        if line.startswith("data: "):
+            line = line[6:].strip()
+        if line == "[DONE]":
             continue
         try:
-            data = json.loads(block)
+            data = json.loads(line)
             choices = data.get("choices")
             if choices and len(choices) > 0:
                 delta = choices[0].get("delta")
@@ -162,6 +171,19 @@ async def fetch_full(prompt: str, system_instructions: Optional[str], model: Opt
                         result = message.get("content", "")
                         if result:
                             return result
+                            
+            # If the response is already in SSE chunk format within the JSON, extract directly
+            # This handles cases where the API returns chunks inline with delta content
+            if isinstance(data, dict) and "choices" in data:
+                result = ""
+                choices = data.get("choices", [])
+                for choice in choices:
+                    delta = choice.get("delta", {})
+                    content_val = delta.get("content", "")
+                    if content_val:
+                        result += content_val
+                if result:
+                    return result
         except (json.JSONDecodeError, KeyError, TypeError):
             pass
         
@@ -170,7 +192,9 @@ async def fetch_full(prompt: str, system_instructions: Optional[str], model: Opt
         for line in content.split("\n"):
             line = line.strip()
             if line:
-                result += parse_sse_line(line)
+                parsed = parse_sse_line(line)
+                if parsed:
+                    result += parsed
         return result
 
 
